@@ -10,8 +10,8 @@
 #include "board.h"
 #include "dsp.h"
 
-#define BUF_SIZE_SAMPLES 16
-#define LLI_POOL_SIZE 20
+#define BUF_SIZE_SAMPLES 8
+#define LLI_POOL_SIZE 20 // enough for very large buffers
 #define FIFO_THRESHOLD 3
 
 // from dsp.c
@@ -30,10 +30,10 @@ struct bflb_dma_channel_lli_pool_s audac_dma_lli_pool[LLI_POOL_SIZE];
 struct bflb_dma_channel_lli_transfer_s transfers_adc[1];
 struct bflb_dma_channel_lli_transfer_s transfers_dac[1];
 
-static __attribute((aligned(32))) uint16_t buf_in_a[BUF_SIZE_SAMPLES] = {0};
-static __attribute((aligned(32))) uint16_t buf_in_b[BUF_SIZE_SAMPLES] = {0};
-static __attribute((aligned(32))) uint16_t buf_out_a[BUF_SIZE_SAMPLES] = {0};
-static __attribute((aligned(32))) uint16_t buf_out_b[BUF_SIZE_SAMPLES] = {0};
+static __attribute((aligned(16))) uint16_t buf_in_a[BUF_SIZE_SAMPLES] = {0};
+static __attribute((aligned(16))) uint16_t buf_in_b[BUF_SIZE_SAMPLES] = {0};
+static __attribute((aligned(16))) uint16_t buf_out_a[BUF_SIZE_SAMPLES] = {0};
+static __attribute((aligned(16))) uint16_t buf_out_b[BUF_SIZE_SAMPLES] = {0};
 
 volatile uint8_t buf_in_p = 0;
 volatile uint8_t buf_out_p = 0;
