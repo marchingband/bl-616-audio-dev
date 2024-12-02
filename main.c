@@ -1,3 +1,6 @@
+#include <FreeRTOS.h>
+#include "task.h"
+
 #include "bflb_auadc.h"
 #include "bflb_audac.h"
 #include "bflb_gpio.h"
@@ -5,9 +8,11 @@
 
 #include "bl616_glb.h"
 #include "board.h"
+#include "dsp.h"
 
-#define BUF_SIZE_SAMPLES 1024 * 4
-#define LLI_POOL_SIZE 2
+#define BUF_SIZE_SAMPLES 16
+#define LLI_POOL_SIZE 20
+#define FIFO_THRESHOLD 3
 
 // from dsp.c
 void dsp_init(size_t buf_size);
@@ -25,24 +30,43 @@ struct bflb_dma_channel_lli_pool_s audac_dma_lli_pool[LLI_POOL_SIZE];
 struct bflb_dma_channel_lli_transfer_s transfers_adc[1];
 struct bflb_dma_channel_lli_transfer_s transfers_dac[1];
 
-uint16_t buf_in_a[BUF_SIZE_SAMPLES] = {0};
-uint16_t buf_in_b[BUF_SIZE_SAMPLES] = {0};
-uint16_t buf_out_a[BUF_SIZE_SAMPLES] = {0};
-uint16_t buf_out_b[BUF_SIZE_SAMPLES] = {0};
+static __attribute((aligned(32))) uint16_t buf_in_a[BUF_SIZE_SAMPLES] = {0};
+static __attribute((aligned(32))) uint16_t buf_in_b[BUF_SIZE_SAMPLES] = {0};
+static __attribute((aligned(32))) uint16_t buf_out_a[BUF_SIZE_SAMPLES] = {0};
+static __attribute((aligned(32))) uint16_t buf_out_b[BUF_SIZE_SAMPLES] = {0};
 
-uint8_t buf_in_p = 0;
-uint8_t buf_out_p = 0;
+volatile uint8_t buf_in_p = 0;
+volatile uint8_t buf_out_p = 0;
+bool dac_started = false;
+TaskHandle_t faust_task_h = NULL;
+
+void audac_dma_callback(void *arg)
+{
+    transfers_dac[0].dst_addr = (uint32_t)DMA_ADDR_AUDAC_TDR;
+    if(buf_out_p == 0){
+        transfers_dac[0].src_addr = (uint32_t)buf_out_b;
+        transfers_dac[0].nbytes = sizeof(buf_out_b);
+        bflb_l1c_dcache_clean_range(buf_out_b, sizeof(buf_out_b));
+        bflb_dma_channel_lli_reload(audac_dma_hd, audac_dma_lli_pool, LLI_POOL_SIZE, transfers_dac, 1);
+        bflb_dma_channel_start(audac_dma_hd);
+        buf_out_p = 1;
+    } else {
+        transfers_dac[0].src_addr = (uint32_t)buf_out_a;
+        transfers_dac[0].dst_addr = (uint32_t)DMA_ADDR_AUDAC_TDR;
+        transfers_dac[0].nbytes = sizeof(buf_out_a);
+        bflb_l1c_dcache_clean_range(buf_out_a, sizeof(buf_out_a));
+        bflb_dma_channel_lli_reload(audac_dma_hd, audac_dma_lli_pool, LLI_POOL_SIZE, transfers_dac, 1);
+        bflb_dma_channel_start(audac_dma_hd);
+        buf_out_p = 0;
+    }
+}
 
 void auadc_dma_callback(void *arg)
 {
-    // printf("adc, %llu\n", bflb_mtimer_get_time_us());
-    if(buf_in_p == 0)
-    {
+    if(buf_in_p == 0){
         transfers_adc[0].dst_addr = (uint32_t)buf_in_b;
         buf_in_p = 1;
-    }
-    else
-    {
+    } else {
         transfers_adc[0].dst_addr = (uint32_t)buf_in_a;
         buf_in_p = 0;
     }
@@ -50,38 +74,10 @@ void auadc_dma_callback(void *arg)
     transfers_adc[0].nbytes = sizeof(buf_in_b);
     bflb_dma_channel_lli_reload(auadc_dma_hd, auadc_dma_lli_pool, LLI_POOL_SIZE, transfers_adc, 1);
     bflb_dma_channel_start(auadc_dma_hd);
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    xTaskNotifyFromISR(faust_task_h, 0, eNoAction, &xHigherPriorityTaskWoken);
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
-
-void audac_dma_callback(void *arg)
-{
-    // printf("dac, %llu\n", bflb_mtimer_get_time_us());
-    transfers_dac[0].dst_addr = (uint32_t)DMA_ADDR_AUDAC_TDR;
-    if(buf_out_p == 0){
-        transfers_dac[0].src_addr = (uint32_t)buf_out_b;
-        transfers_dac[0].nbytes = sizeof(buf_out_b);
-        bflb_dma_channel_lli_reload(audac_dma_hd, audac_dma_lli_pool, LLI_POOL_SIZE, transfers_dac, 1);
-        bflb_dma_channel_start(audac_dma_hd);
-        if(buf_in_p == 0){
-            dsp_run(buf_in_b, buf_out_a);
-        } else {
-            dsp_run(buf_in_a, buf_out_a);
-        }
-        buf_out_p = 1;
-    } else {
-        transfers_dac[0].src_addr = (uint32_t)buf_out_a;
-        transfers_dac[0].dst_addr = (uint32_t)DMA_ADDR_AUDAC_TDR;
-        transfers_dac[0].nbytes = sizeof(buf_out_a);
-        bflb_dma_channel_lli_reload(audac_dma_hd, audac_dma_lli_pool, LLI_POOL_SIZE, transfers_dac, 1);
-        bflb_dma_channel_start(audac_dma_hd);
-        if(buf_in_p == 0){
-            dsp_run(buf_in_b, buf_out_b);
-        } else {
-            dsp_run(buf_in_a, buf_out_b);
-        }
-        buf_out_p = 0;
-    }
-}
-
 
 /* audio gpio init*/
 void audio_gpio_init(void)
@@ -122,7 +118,7 @@ static void auadc_init(void)
         .sampling_rate = AUADC_SAMPLING_RATE_48K,
         .input_mode = AUADC_INPUT_MODE_ADC,
         .data_format = AUADC_DATA_FORMAT_16BIT,
-        .fifo_threshold = 3,
+        .fifo_threshold = FIFO_THRESHOLD,
     };
 
     /* audio adc analog config */
@@ -185,7 +181,7 @@ static void audac_init(void)
         .source_channels_num = AUDAC_SOURCE_CHANNEL_SINGLE,
         .mixer_mode = AUDAC_MIXER_MODE_ONLY_L,
         .data_format = AUDAC_DATA_FORMAT_16BIT,
-        .fifo_threshold = 3,
+        .fifo_threshold = FIFO_THRESHOLD,
     };
 
     /* audio dac volume config */
@@ -226,17 +222,40 @@ void audac_dma_init(void)
     audac_dma_cfg.dst_burst_count = DMA_BURST_INCR4;
     audac_dma_cfg.src_width = DMA_DATA_WIDTH_16BIT;
     audac_dma_cfg.dst_width = DMA_DATA_WIDTH_16BIT;
-
     audac_dma_hd = bflb_device_get_by_name("dma0_ch1");
     bflb_dma_channel_init(audac_dma_hd, &audac_dma_cfg);
     bflb_dma_channel_irq_attach(audac_dma_hd, audac_dma_callback, NULL);
+}
 
-    transfers_dac[0].src_addr = (uint32_t)buf_out_a;
-    transfers_dac[0].dst_addr = (uint32_t)DMA_ADDR_AUDAC_TDR;
-    transfers_dac[0].nbytes = sizeof(buf_out_a);
-
-    dma_lli_cnt = bflb_dma_channel_lli_reload(audac_dma_hd, audac_dma_lli_pool, LLI_POOL_SIZE, transfers_dac, 1);
-    // bflb_dma_channel_lli_link_head(audac_dma_hd, audac_dma_lli_pool, dma_lli_cnt);
+void faust_task(void *args){
+    while(1){
+        if(xTaskNotifyWait(UINT32_MAX, UINT32_MAX, NULL, UINT32_MAX)){
+            if(buf_in_p == 0){
+                bflb_l1c_dcache_invalidate_range(buf_in_b, sizeof(buf_in_b));
+                if(buf_out_p == 0){
+                    dsp_run(buf_in_b, buf_out_b);
+                    bflb_l1c_dcache_clean_range(buf_out_b, sizeof(buf_out_b));
+                } else {
+                    dsp_run(buf_in_b, buf_out_a);
+                    bflb_l1c_dcache_clean_range(buf_out_a, sizeof(buf_out_a));
+                }
+            } else {
+                bflb_l1c_dcache_invalidate_range(buf_in_a, sizeof(buf_in_a));
+                if(buf_out_p == 0){
+                    dsp_run(buf_in_a, buf_out_b);
+                    bflb_l1c_dcache_clean_range(buf_out_b, sizeof(buf_out_b));
+                } else {
+                    dsp_run(buf_in_a, buf_out_a);
+                    bflb_l1c_dcache_clean_range(buf_out_a, sizeof(buf_out_a));
+                }
+            }
+            if(!dac_started){
+                dac_started = true;
+                audac_dma_callback((void *)0);
+                bflb_audac_feature_control(audac_hd, AUDAC_CMD_PLAY_START, 0);
+            }
+        }
+    }
 }
 
 int main(void)
@@ -245,7 +264,7 @@ int main(void)
     board_init();
     dsp_init(BUF_SIZE_SAMPLES);
 
-    printf("audac case start \r\n");
+    printf("audac case start\n");
 
     /* gpio init */
     audio_gpio_init();
@@ -262,13 +281,8 @@ int main(void)
     bflb_dma_channel_start(auadc_dma_hd);
     bflb_auadc_feature_control(auadc_hd, AUADC_CMD_RECORD_START, 0);
 
-    bflb_dma_channel_start(audac_dma_hd);
-    bflb_audac_feature_control(audac_hd, AUDAC_CMD_PLAY_START, 0);
+    xTaskCreate(faust_task, "Faust", 1024 * 16, NULL, 2, &faust_task_h);
 
-    printf("audac case end \r\n");
-
+    printf("audac case end\n");
     vTaskStartScheduler();
-    while (1) {
-        bflb_mtimer_delay_ms(1000);
-    }
 }
